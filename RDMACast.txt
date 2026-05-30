@@ -1,0 +1,368 @@
+# ─────────────────────────────────────────────────────────────────────
+#	ATOMIC MULTICAST BASATO SU RDMA (RamCast)
+#
+# Il seguente pseudocodice riporta l'implementazione di Atomic Multicast introdotta
+# nel paper "RamCast: RDMA-based Atomic Multicast".
+#
+# In breve, questa è una implementazione di Fault tolerant Atomic Multicast pensata
+# per il modello a memoria condivisa (shared-memory) anziché message-passing. Sfrutta
+# la tecnologia RDMA (Remote Direct Memory Access), che permette ad un processo di
+# scrivere/leggere direttamente nella memoria di un altro processo senza coinvolgere
+# la sua CPU. Grazie a questo, RamCast consegna un messaggio multi-gruppo in soli
+# 3 RDMA write delay, sia ai Leader che ai Follower dei gruppi coinvolti (Anche WBcast impiega
+# 3 delay ma il ritardo per un messaggio tramite protocollo message-passing è maggiore
+# rispetto al ritardo per una RDMA write).
+#
+# L'idea di base combina tre ingredienti:
+#   1) L'algoritmo di Skeen per l'ordinamento genuino tramite timestamp logici;
+#   2) Il modello Leader-Follower per la replicazione;
+#   3) Protected Memory Paxos: Implementa Paxos per RDMA. Al processo Leader viene dato il
+#      permesso di scrivere direttamente il timestamp nella memoria condivisa dal follower.
+#      Se il leader crasha, i permessi devono essere tolti al vecchio leader ed assegnati al nuovo.
+#
+# Per l'implementazione dell'algoritmo generale vengono usate solo le operazioni One-sided (write(), read()).
+# Le operazioni Two-sided (send(), receive()) sono utilizzate SOLO per il recovery in caso di fault.
+#
+# ─────────────────────────────────────────────────────────────────────
+
+
+
+# ─────────────────────────────────────────────────────────────────────
+# STRUTTURE DATI (Algorithm 1 del paper)
+# ─────────────────────────────────────────────────────────────────────
+#
+# In RamCast la comunicazione avviene scrivendo in due tipi di buffer che ogni
+# processo (server) espone in memoria, uno per ogni CLIENT c del sistema:
+#
+#   - M (Message buffer)  -> buffer CONDIVISO: può essere letto e scritto da
+#                            QUALSIASI processo. Contiene i messaggi multicast.
+#   - T (Timestamp buffer)-> buffer PROTETTO: può essere letto da tutti, ma scritto
+#                            SOLO dal Leader del gruppo (grazie ai permessi RDMA).
+#                            Contiene i timestamp proposti.
+#
+# Il buffer M di ogni client c è diviso in slot. Lo slot M[c, i] contiene l'i-esimo
+# messaggio inviato dal client c, ed ha uno slot corrispondente T[c, i] per i timestamp.
+
+
+# --- Contenuto di uno slot del Message buffer M[c, i] ---
+M[c,i].msg					# il messaggio m inviato in multicast dal client c
+M[c,i].dst					# l'insieme dei gruppi destinatari di m
+M[c,i].ptr[g, 1..n]				# VETTORE DI INDIRIZZI: per ogni gruppo g destinatario,
+						# indica in quale slot si trova msg presso ciascun
+						# processo p del gruppo g. Serve perché lo slot i del
+						# mittente può corrispondere ad uno slot diverso nella
+						# memoria del destinatario.
+						# (null se g non è destinatario)
+M[c,i].ack[g, 1..n]				# VETTORE DI ACK: per ogni gruppo g, raccoglie il
+						# riconoscimento del timestamp da parte dei processi di g
+						# (ogni processo scrive qui il proprio round come ACK)
+M[c,i].tmp					# il timestamp di m, inizialmente ⊥
+M[c,i].stat					# STATO di m, può essere:
+						#   ⊥        -> slot vuoto / non usato
+						#   MCAST    -> messaggio scritto, in attesa di ordinamento
+						#   ORDERED  -> è stato assegnato il timestamp finale
+						#   DONE     -> il messaggio è stato consegnato (delivered)
+
+
+# --- Contenuto di uno slot del Timestamp buffer T[c, i] ---
+T[c,i].tmp[1..k]				# VETTORE DI TIMESTAMP: tmp[g] contiene il timestamp
+						# proposto dal Leader del gruppo g per questo messaggio
+T[c,i].rnd[1..k]				# VETTORE DI ROUND: rnd[g] è il round del Leader di g
+						# (inizialmente (0,0)). Analogo al "ballot" di Paxos/WBCast,
+						# serve a tracciare chi sia il Leader corrente del gruppo g.
+
+
+# --- Variabili del CLIENT c ---
+cptr[1..k, 1..n] ← (0, ...)			# VETTORE DI INDIRIZZI lato client: indica il prossimo slot
+						# disponibile nei buffer M e T per ogni gruppo g e processo p.
+						# (il client deve sapere DOVE scrivere nella memoria altrui)
+
+
+# --- Variabili di ogni SERVER p nel gruppo g ---
+clock ← (0, p) ∈ (N × P)			# CLOCK LOGICO: usato per calcolare i timestamp.
+						# È una coppia ⟨cnt, pid⟩ dove cnt è uno scalare e pid è
+						# l'identificatore di processo (unico nel sistema). Vale:
+						#   ⟨cnt,pid⟩ > ⟨cnt',pid'⟩  sse  cnt > cnt', oppure
+						#                                  cnt = cnt' AND pid > pid'
+						#   e time(⟨cnt,pid⟩) = cnt
+						# (questo garantisce timestamp totalmente ordinati e unici)
+round ← (0, p) ∈ (N × P)			# ROUND di p, usato quando p è il Leader del gruppo
+status ∈ {LEADER, FOLLOWER}			# INDICA IL RUOLO di p nel proprio gruppo
+Leader[1..k]					# VETTORE: visione di p su CHI sia il Leader di ogni gruppo
+						# (analogo a Cur_leader[] di WBCast: serve a sapere a chi
+						# inviare/scrivere per i gruppi remoti)
+Round[1..k]					# VETTORE: ultimo round accettato da p per ogni gruppo
+						# (Round[g] = il round più grande accettato da Leader[g])
+
+
+# ─────────────────────────────────────────────────────────────────────
+#
+#		ALGORITMO CASO NORMALE (Leader stabile)
+#
+# Questo è l'algoritmo che funziona nel caso ottimale, quando i Leader dei gruppi
+# coinvolti sono operativi e stabili. 
+#
+# ─────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CLIENT (mittente)       
+# ─────────────────────────────────────────────────────────────────────
+
+# Il client invia in multicast il messaggio m ai gruppi in m.dst scrivendolo
+# DIRETTAMENTE (via RDMA write) nella memoria di TUTTI i processi destinatari.
+
+procedure MULTICAST(m, m.dst)								# {Task 1}
+	for each group h in m.dst, for each process q in h
+		cptr[q] = cptr[q] + 1							# Avanzo al prossimo slot libero presso q
+
+	RELAY(c, m, m.dst, cptr)
+
+
+# La procedura RELAY effettua la scrittura remota vera e propria. Scrive nei 4 campi
+# dello slot di ogni destinatario; impostando .stat = MCAST per ULTIMO si segnala al
+# destinatario (che fa busy-polling) che lo slot è pronto e completo.
+
+procedure RELAY(c, msg, dst, ptr)
+	for each group h in dst, for each process q in h
+		write(q, M[c, ptr[q]].msg,  msg)					# Scrivo il messaggio nella memoria di q
+		write(q, M[c, ptr[q]].dst,  dst)					# Scrivo i destinatari
+		write(q, M[c, ptr[q]].ptr,  ptr)					# Scrivo il vettore di indirizzi
+		write(q, M[c, ptr[q]].stat, MCAST)					# Per ULTIMO: marco lo slot come MCAST
+
+# ─────────────────────────────────────────────────────────────────────
+# LEADER del gruppo g: propone il timestamp
+# ─────────────────────────────────────────────────────────────────────
+
+# Quando il Leader di g si accorge (tramite polling) che è arrivato un nuovo messaggio
+# nel proprio buffer, calcola un timestamp tentativo (basato sul clock, come in Skeen)
+# e lo scrive nel buffer PROTETTO T sia dei propri Follower, sia dei Leader degli altri
+# gruppi destinatari.
+
+(Faccio polling per sul campo M[c,i].stat per rilevare l'arrivo di un messaggio)
+
+when ∃c, i : M[c,i].stat == MCAST  AND  p == Leader[g]				# {Task 2}
+	clock = clock + 1							# Incremento il clock logico
+	for each follower q in g  AND  each leader q in M[c,i].dst		# Destinatari della scrittura:
+										# i miei Follower + i Leader degli altri gruppi
+		j = M[c,i].ptr[q]						# Trovo lo slot corretto presso q
+		write(q, T[c,j].tmp[g], ⟨clock, p⟩)				# Scrivo il timestamp proposto da g
+		write(q, T[c,j].rnd[g], round)					# Scrivo il mio round (così q sa che è valido)
+		if write denied then end task					# Se un permesso mi è stato revocato, un altro
+										# processo è diventato Leader di g: mi fermo.
+
+
+# ─────────────────────────────────────────────────────────────────────
+# FOLLOWER del gruppo g: riconosce il timestamp
+# ─────────────────────────────────────────────────────────────────────
+
+# Quando un Follower rileva che il proprio Leader ha assegnato un timestamp ad un
+# messaggio, aggiorna il proprio clock (per garantire la monotonicità, utile nel caso
+# diventi Leader) e poi RICONOSCE il timestamp scrivendo il round nel vettore ack di
+# OGNI processo destinatario del messaggio.
+#
+# Questo signfica che ogni messaggio ha il corrispettivo 'spazio' nel vettore degli ack.
+# Un processo asserisce un ack ogni volta che ottiene un nuovo timestamp (Per tutti i gruppi destinatari)
+#
+# La condizione "T[c,i].rnd[g] == Round[g]" verifica che il timestamp provenga
+# davvero dal Leader corrente (round allineato), analogo al controllo su cballot/ballot
+# che si fa in WBCast.
+
+when ∃c, i : M[c,i].stat == MCAST  AND  T[c,i].rnd[g] == Round[g]		# {Task 3}
+	clock = max(clock, time(T[c,i].tmp[g]))					# Aggiorno il mio clock al timestamp del Leader
+	for each group h in M[c,i].dst, for each process q in h
+		j = M[c,i].ptr[q]						# Trovo lo slot corretto presso q
+		write(q, M[c,j].ack[p], Round[g])				# ACK: scrivo il mio round nel buffer di ogni
+										# destinatario per segnalare "ho accettato questo ts"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# LEADER del gruppo g: propaga i timestamp degli ALTRI gruppi
+# ─────────────────────────────────────────────────────────────────────
+
+# Quando il Leader di g legge un timestamp scritto dal Leader di un ALTRO gruppo h,
+# aggiorna il proprio clock e poi PROPAGA quel timestamp ai propri Follower.
+#
+# IMPORTANTE: solo il Leader di un gruppo viene aggiornato con i timestamp provenienti
+# dai Leader degli altri gruppi (vedi Task 2). Quindi è compito del Leader "girare"
+# questa informazione ai propri Follower, così che anche loro possano calcolare il
+# timestamp finale. Questo garantisce che i timestamp visti dal gruppo siano coerenti.
+
+when ∃c, i, h : M[c,i].stat == MCAST  AND  T[c,i].rnd[h] == Round[h]  AND  h ≠ g	# {Task 4}
+	clock = max(clock, time(T[c,i].tmp[h]))						# Aggiorno il mio clock al timestamp ricevuto da h
+	for each follower q in g							# Solo verso i MIEI Follower
+		j = M[c,i].ptr[q]
+		write(q, T[c,j].tmp[h], T[c,i].tmp[h])					# Propago il timestamp del gruppo h
+		if write denied then end task						# Permesso revocato -> mi fermo
+
+
+# ─────────────────────────────────────────────────────────────────────
+# OGNI PROCESSO: calcola il timestamp finale e ordina il messaggio
+# ─────────────────────────────────────────────────────────────────────
+
+# Quando, per un gruppo h destinatario, un QUORUM di processi di h ha riconosciuto
+# (ACK) il timestamp proposto, quel timestamp è stabile per h. Il processo aggiorna
+# il timestamp finale del messaggio prendendo il MASSIMO (come in Skeen).
+# Quando questo vale per TUTTI i gruppi destinatari, il messaggio diventa ORDERED.
+
+upon ∃c, i, h : M[c,i].stat == MCAST  AND						# {Task 5}
+     ∃ quorum Q in h : for each q in Q : M[c,i].ack[q] == Round[h]
+	M[c,i].tmp = max(M[c,i].tmp, T[c,i].tmp[h])				# Timestamp finale = max dei timestamp dei gruppi
+
+	if  for each group h in M[c,i].dst :					# Se OGNI gruppo destinatario ha raggiunto
+	    ∃ quorum Q in h : for each q in Q : M[c,i].ack[q] == Round[h]  then	# un quorum di ACK...
+		M[c,i].stat = ORDERED						# ...il messaggio è ordinato (ha il ts definitivo)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# OGNI PROCESSO: consegna (delivery) del messaggio
+# ─────────────────────────────────────────────────────────────────────
+
+# Un processo consegna un messaggio ORDERED solo quando è certo che nessun altro
+# messaggio potrà ricevere un timestamp più piccolo. Cioè: non deve esistere nessun
+# altro messaggio (in stato ORDERED o ancora MCAST) con timestamp INFERIORE.
+# È la stessa logica di Skeen/WBCast: si consegna in ordine di timestamp finale,
+# evitando di consegnare se un messaggio con ts minore potrebbe ancora arrivare.
+
+upon ∃c, i : M[c,i].stat == ORDERED  AND						# {Task 6}
+     ∄ d, j : M[d,j].stat ∈ {ORDERED, MCAST}  AND  M[d,j].tmp < M[c,i].tmp
+	deliver(m)								# Consegna effettiva all'applicazione
+	M[c,i].stat = DONE							# Marco come consegnato (non sarà riconsegnato)
+
+
+
+# QUESTO E' L'ALGORITMO FUNZIONANTE NEL CASO OTTIMALE
+
+
+########################## ───────────────────────── ##########################
+########################## ───────────────────────── ##########################
+
+#		 GESTIONE DI FALLIMENTI E SOSPETTI
+#
+# RamCast gestisce il fallimento di un Leader con un meccanismo simile a Paxos. Può
+# quindi tollerare che più processi credano di essere Leader in un gruppo senza
+# violare la safety. Per garantire il progresso (liveness), però, alla fine deve
+# esserci un solo Leader operativo per gruppo.
+#
+# Quando un processo diventa Leader, deve "mettersi in pari" con il Leader precedente
+# (catch-up). A DIFFERENZA del caso normale, questa procedura usa la COMUNICAZIONE A
+# MESSAGGI (send/receive) oltre alla memoria condivisa: in RDMA il message-passing è
+# meno efficiente, ma riduce la complessità (non si devono gestire accessi concorrenti
+# alla memoria condivisa). Dato che i fallimenti sono rari, questo compromesso è accettabile.
+#
+# L'utilizzo di send/receive in questo caso è necessario in quanto, durante il recovery,
+# inizialmente il nuovo Leader non ha i permessi per accedere alla memoria degli altri processi/Leader.
+#
+########################## ───────────────────────── ##########################
+########################## ───────────────────────── ##########################
+
+
+# ─────────────────────────────────────────────────────────────────────
+# NUOVO LEADER: invia la richiesta di catch-up
+# ─────────────────────────────────────────────────────────────────────
+
+# Quando un processo p, che diventerà il prossimo Leader del gruppo, sospetta il
+# Leader corrente, individua per ogni client il proprio FUS (First Undecided Slot):
+# il primo slot ancora "indeciso", cioè in stato MCAST. Sceglie un nuovo round (più
+# alto) e invia un messaggio di catch_up a TUTTI i processi del sistema.
+#
+# Poiché lo slot i nel buffer del nuovo Leader può corrispondere ad uno slot diverso
+# presso un altro processo, p deve TRADURRE il proprio FUS in uno slot significativo
+# per il processo contattato (riga con xFUS, usando il vettore ptr).
+
+when suspect Leader[g]  AND  p is g's next leader				# {Task 7}
+	for each client c
+		FUS[c] = i, dove M[c,i] è il primo slot indeciso (stato MCAST)
+	round = ⟨time(round) + 1, p⟩						# Nuovo round, più alto dell'ultimo visto
+	for each group h in Γ
+		for each process q in h
+			for each client c:  xFUS[c] = M[c, FUS[c]].ptr[h, q]	# Traduco il FUS nello slot valido presso q
+			send(catch_up, xFUS, round) to q			# Invio (a MESSAGGI) la richiesta di catch-up
+
+
+# ─────────────────────────────────────────────────────────────────────
+# OGNI PROCESSO: risponde alla richiesta di catch-up
+# ─────────────────────────────────────────────────────────────────────
+
+# Un processo p considera un messaggio catch_up dal nuovo Leader q del gruppo h SOLO
+# se q ha scelto un round più alto del round corrente di h presso p. È un requisito di
+# Paxos: garantisce che un nuovo Leader non decida un valore diverso da uno già deciso.
+#
+# Se la richiesta è accettabile, p REVOCA i permessi al vecchio Leader e li CONCEDE a q
+# (così solo q potrà scrivere nel buffer T di p), raccoglie tutte le informazioni
+# richieste sugli slot pendenti e le invia a q. Infine aggiorna round e Leader di h.
+
+# Pend contiene tutte le richieste che erano già iniziate con il Leader precedente.
+# Il nuovo Leader parte da queste e le porta a termine.
+
+upon receive(catch_up, FUS, round) from q in h  AND  round > Round[h]		# {Task 8}
+	revoca i permessi al Leader precedente  e  concedi il permesso a q	# Gestione permessi RDMA
+	pend = ∅
+	for each client c
+		sia j l'ultimo slot in M tale che M[c,j] ≠ ⊥
+		for i in FUS[c]..j
+			if h ∈ M[c,i].dst then					# Considero solo gli slot di cui h è destinatario
+				pend = pend ∪ (c, i, M[c,i].msg, M[c,i].dst,
+				               M[c,i].ptr, T[c,i].tmp[g], T[c,i].rnd[g])
+	send(my_state, pend) to q						# Invio (a MESSAGGI) il mio stato pendente
+	Round[h] = round							# Aggiorno il round di h
+	Leader[h] = q								# Aggiorno il Leader di h
+
+
+# ─────────────────────────────────────────────────────────────────────
+# NUOVO LEADER: elabora le risposte e ripropone i timestamp
+# ─────────────────────────────────────────────────────────────────────
+
+# Quando il nuovo Leader riceve le risposte (my_state) da un QUORUM di processi di un
+# gruppo, elabora ogni slot i di ogni client c. Per ciascuno seleziona la risposta col
+# ROUND PIÙ ALTO: da Paxos, questo garantisce che se un timestamp è già stato deciso,
+# è proprio quello col round più alto.
+#
+# Il comportamento dipende da DA QUALE gruppo arrivano le risposte:
+#   - Se dal PROPRIO gruppo (g = h): il nuovo Leader prende il timestamp della risposta
+#     selezionata (se esiste un round > 0), oppure ne sceglie uno nuovo col proprio clock.
+#     In entrambi i casi PROPONE quel timestamp ai membri del proprio gruppo e ai Leader
+#     degli altri gruppi coinvolti (come in Task 2).
+#   - Se da un ALTRO gruppo: il nuovo Leader si limita a INOLTRARE il timestamp della
+#     risposta selezionata ai propri Follower (come in Task 4).
+
+upon receive(my_state, pend) from quorum Q in h,				# {Task 9}
+      including p's response if g == h
+	bag = unione di tutti i pend ricevuti da h
+	sia max_ts il timestamp tmp più grande presente in bag
+	clock = max(clock, time(max_ts))					# Allineo il clock al ts massimo visto
+
+	for each (c, i, −, −, −, −, −) in bag					# bag sarebbe l'unione di tutti i pend ricevuti dai diversi follower
+		# Seleziono, per lo slot (c,i), la risposta col round più alto:
+		sia (c, i, msg, dst, ptr, tmp, rnd) in bag tale che
+		    ∄ (c, i, −, −, −, −, rnd') in bag  con  rnd' > rnd
+
+		if g == h then							# --- Risposte dal MIO gruppo ---
+			if rnd > 0 then
+				t = tmp						# Un ts era già stato proposto: lo riuso
+			else
+				clock = clock + 1
+				t = ⟨clock, g⟩					# Nessun ts deciso: ne scelgo uno nuovo
+			for each q in g  AND  each leader q in dst
+				write(q, T[c, ptr[q]].tmp[g], t)		# Propongo il ts (come Task 2)
+				write(q, T[c, ptr[q]].rnd[g], round)
+				if write denied then end task
+		else								# --- Risposte da un ALTRO gruppo ---
+			for each q in g					# Solo verso i miei Follower
+				write(q, T[c, ptr[q]].tmp[h], tmp)		# Inoltro il ts del gruppo h (come Task 4)
+				if write denied then end task
+
+
+# ─────────────────────────────────────────────────────────────────────
+# GESTIONE DI CLIENT FALLITI
+# ─────────────────────────────────────────────────────────────────────
+
+# Si considera anche il caso di client guasti, che potrebbero non aver aggiornato
+# TUTTI i destinatari di un messaggio multicast (lasciando il sistema in uno stato
+# incompleto). Quando un processo rileva il fallimento di un client, RILANCIA (relay)
+# tutti i messaggi multicast da quel client che non sono ancora stati ordinati.
+# Solo i messaggi in stato MCAST necessitano di essere rilanciati.
+
+when suspect client c								# {Task 10}
+	for each i tale che M[c,i].stat == MCAST
+		RELAY(c, M[c,i].msg, M[c,i].dst, M[c,i].ptr)

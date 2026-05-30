@@ -1,0 +1,161 @@
+# ─────────────────────────────────────────────────────────────────────
+# PAXOS PER L'ACCORDO SUL TIMESTAMP LOCALE IN UN GRUPPO G_i
+#
+# Contesto: ogni replica di G_i ha ricevuto (PROPOSE, m) e vuole che
+# il gruppo concordi su UN timestamp proposto per m.
+# Istanza Paxos identificata da: inst = (G_i, m.id, "propose_ts")
+#
+# Ruoli: ogni replica di G_i è simultaneamente Proposer, Acceptor e Learner.
+# Quorum: maggioranza Q = ⌊|G_i|/2⌋ + 1 = f+1  (con |G_i| = 2f+1)
+# Detto semplicemente abbiamo in totale 2f+1 processi per gruppo ed è
+# necessario che almeno f+1 processi accettino un determinato timestamp affinché
+# questo possa essere scelto come timestamp definitivo.
+# ─────────────────────────────────────────────────────────────────────
+
+# Nota: Per inst si intendono i valori di una istanza Paxos (ovvero quelli generati durante un "giro" completo)
+# Ad ogni messaggio da inviare si crea una nuova istanza Paxos
+// ─── STATO LOCALE DI OGNI REPLICA p PER L'ISTANZA inst ───
+
+state[inst] = {
+    promised_ballot     = 0,        # massimo ballot a cui ho promesso (Acceptor)
+    accepted_ballot     = 0,        # ballot dell'ultimo valore accettato (Acceptor)
+    accepted_value      = ⊥,        # valore accettato (Acceptor)
+    decided_value       = ⊥,        # valore deciso (Learner)
+    my_ballot           = 0,        # ballot che sto usando come Proposer
+    promises_received   = {},       # PROMISE raccolte (Proposer)
+    accepts_received    = {}        # ACCEPTED raccolte (Learner)
+}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# FASE 0 — Decidere chi prova a fare il proposer
+# ─────────────────────────────────────────────────────────────────────
+# In Multi-Paxos c'è un leader stabile che salta direttamente la Fase 1.
+# In Paxos "puro" qualunque replica può tentare. Per evitare che TUTTE
+# le repliche di G_i partano contemporaneamente come proposer (livelock),
+# si usa una di queste strategie:
+#
+#   (a) Solo il leader corrente di G_i parte come proposer. Le altre
+#       repliche aspettano un timeout e diventano proposer solo se il
+#       leader sembra morto.
+#   (b) Backoff randomizzato: ogni replica aspetta delay = random() * k
+#       prima di tentare.
+#
+# Assumiamo strategia (a) con leader L di G_i.
+
+
+upon receive (PROPOSE, m) at replica p in G_i:
+
+    proposed_ts_local = local_clock_p + 1
+
+    if p == leader(G_i):
+        # Sono il leader → avvio l'istanza Paxos come proposer
+        start_paxos_proposer(inst = (G_i, m.id, "propose_ts"),
+                             my_value = proposed_ts_local)
+    else:
+        # Sono un acceptor passivo, aspetto i messaggi del leader.
+        # Se entro un timeout non sento nulla, tento io stesso.
+        set_timeout(inst, T) → start_paxos_proposer(inst, proposed_ts_local)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# FASE 1 — PREPARE / PROMISE  (Proposer ↔ Acceptor)
+# Serve a: (1) ottenere il diritto di proporre con un certo ballot,
+#          (2) scoprire se c'è già un valore accettato in precedenza
+#              che dovrei rispettare.
+# ─────────────────────────────────────────────────────────────────────
+
+procedure start_paxos_proposer(inst, my_value):
+    state[inst].my_ballot = next_unique_ballot(p)        # es. (counter++, p.id)
+                                                         # — globalmente unico,
+                                                         #   monotono crescente
+    state[inst].promises_received = {}
+
+    send (PREPARE, inst, my_ballot) to all replicas in G_i
+
+
+// ─── lato Acceptor ───
+
+upon receive (PREPARE, inst, b) at replica p:
+    if b > state[inst].promised_ballot:
+        state[inst].promised_ballot = b                  # promessa: non accetterò
+                                                         # più nulla con ballot < b
+        send (PROMISE, inst, b,
+              state[inst].accepted_ballot,
+              state[inst].accepted_value) to sender
+    else:
+        send (NACK, inst, state[inst].promised_ballot) to sender
+
+
+// ─── lato Proposer ───
+
+upon receive (PROMISE, inst, b, prev_ballot, prev_value) at proposer:
+    if b != state[inst].my_ballot: return                # promessa di un'altra fase
+    add (prev_ballot, prev_value) to state[inst].promises_received
+
+    if len(promises_received) >= Q:                         # maggioranza raggiunta!
+        # REGOLA FONDAMENTALE DI PAXOS:
+        # se qualche acceptor ha già accettato un valore in passato
+        # (con un ballot precedente), DEVO riproporre quel valore,
+        # non il mio. Questo garantisce che un valore già potenzialmente
+        # deciso non venga mai sovrascritto.
+
+        choose (b*, v*) = entry in promises_received with maximum prev_ballot #
+
+        if v* != ⊥:
+            value_to_propose = v*                        # eredito un valore precedente
+        else:
+            value_to_propose = my_value                  # nessuno ha mai accettato
+                                                         # nulla → propongo il mio
+
+        send (ACCEPT, inst, my_ballot, value_to_propose) to all replicas in G_i
+
+
+# ─────────────────────────────────────────────────────────────────────
+# FASE 2 — ACCEPT / ACCEPTED  (Proposer ↔ Acceptor → Learner)
+# Si chiede formalmente agli acceptor di accettare il valore.
+# Una volta che la maggioranza accetta, il valore è DECISO.
+# ─────────────────────────────────────────────────────────────────────
+
+// ─── lato Acceptor ───
+
+# ─── Acceptor ───
+upon receive (ACCEPT, inst, b, v) at replica p:
+	if b >= state[inst].promised_ballot:
+        		state[inst].promised_ballot = b
+        		state[inst].accepted_ballot = b
+        		state[inst].accepted_value  = v
+        		send (ACCEPTED, inst, b, v) to LEADER only      # ← solo al leader
+    	else:
+        		send (NACK, inst, state[inst].promised_ballot) to sender
+
+
+# ─── Leader = unico Learner ───
+upon receive (ACCEPTED, inst, b, v) at leader L of G_i:
+    	add (sender, b, v) to state[inst].accepts_received
+	count = |{ s : (s, b, v) ∈ accepts_received }|
+
+    	if count >= Q and state[inst].decided_value == ⊥:
+        		state[inst].decided_value = v                   # decisione presa dal leader
+
+        # 1. Propaga il valore deciso alle altre repliche di G_i
+        	send (DECIDED, inst, v) to all replicas in G_i
+
+# ─── Le altre repliche apprendono passivamente ─── ## E' sempre importante aggiornare gli altri in quanto devono essere in grado di recuperare
+						  ## tutte le informazioni nel caso in cui cada il leader
+upon receive (DECIDED, inst, v) at replica p:
+    	state[inst].decided_value = v
+    	local_clock_p = max(local_clock_p, v)
+    	update m in pending_queue with ts = v, status = UNDELIVERABLE
+
+
+# ─────────────────────────────────────────────────────────────────────
+# GESTIONE NACK / FALLIMENTI
+# ─────────────────────────────────────────────────────────────────────
+
+upon receive (NACK, inst, higher_ballot) at proposer:
+    # Un acceptor ha già promesso a un ballot maggiore del mio
+    # → ritento con un ballot ancora più alto, dopo backoff randomizzato
+    wait random_backoff()
+    state[inst].my_ballot = next_unique_ballot(p, higher_ballot)
+    restart Fase 1 con il nuovo ballot

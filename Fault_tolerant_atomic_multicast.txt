@@ -1,0 +1,118 @@
+# ─────────────────────────────────────────────────────────────────────
+# ATOMIC MULTICAST (Skeen) + PAXOS (Versione Fault tolerant)
+#
+# Tutte le istanze Paxos di "propose_ts" partono in parallelo nei vari
+# gruppi (G_s incluso), eliminando un round di latenza.
+#
+# NB: per il dettaglio del protocollo Paxos (Fase 1 PREPARE/PROMISE,
+# Fase 2 ACCEPT/ACCEPTED, gestione NACK, quorum Q = f+1 su 2f+1 repliche)
+# si rimanda al file "Protocollo_Paxos.txt".
+# Qui Paxos è invocato come una primitiva: paxos_propose(inst, value)
+# ritorna il valore deciso dal gruppo per l'istanza inst.
+# ─────────────────────────────────────────────────────────────────────
+
+
+// ─── STRUTTURE DATI ───
+
+struct messaggio {
+    id,             # (sender_process, seq_num) — il sender è un PROCESSO
+    G,              # insieme dei gruppi destinatari (G_s ∈ G implicitamente)
+    ts,
+    status;
+}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SENDER — un singolo processo s appartenente al gruppo G_s
+# ─────────────────────────────────────────────────────────────────────
+
+procedure SEND(m, G):
+    m.id    = (s, seq_num_s++)         # seq_num locale del processo s
+    m.group = G ∪ {G_s}                # G_s viene incluso tra i destinatari
+
+    # Invio diretto a tutte le repliche di tutti i gruppi coinvolti.
+    # Anche il gruppo G_s (ovverio il gruppo a cui appartiene il sender) riceve il messaggio
+    for each gruppo G_i in m.group:
+        for each replica p in G_i:
+            send (PROPOSE, m) to p
+
+
+# ─────────────────────────────────────────────────────────────────────
+# LATO RICEVENTE — vale per OGNI gruppo G_i in m.group, G_s incluso
+# Tutti i gruppi eseguono Paxos #1 IN PARALLELO.
+# ─────────────────────────────────────────────────────────────────────
+
+upon receive (PROPOSE, m) at process p in group G_i:
+
+    if m.id già processato in G_i:
+        return
+
+    # ─ Paxos #1: G_i concorda sul timestamp proposto ─
+    # Vedi "Protocollo_Paxos.txt" per il dettaglio dell'istanza.
+    proposed_ts_local = local_clock_p + 1
+    proposed_ts = paxos_propose((G_i, m.id, "propose_ts"), proposed_ts_local)
+
+    local_clock_p = max(local_clock_p, proposed_ts)
+
+    add m to pending_queue with:
+        m.timestamp = proposed_ts
+        m.status    = UNDELIVERABLE
+
+    # Solo il leader di G_i invia l'ACK al processo sender s
+    # (NB: l'ACK va al processo s, non al gruppo G_s, perché s è il
+    # punto di raccolta. Se s fallisce prima di aver raccolto tutti
+    # gli ACK, vedi nota sul recovery in fondo.)
+    if p == paxos_leader(G_i):
+        send (ACK, m.id, proposed_ts, G_i) to s
+
+
+# ─────────────────────────────────────────────────────────────────────
+# IL SENDER s RACCOGLIE GLI ACK
+# s raccoglie un ACK per ogni gruppo in m.group (incluso il proprio G_s,
+# che ora si comporta come un gruppo destinatario qualunque).
+# ─────────────────────────────────────────────────────────────────────
+
+upon receive (ACK, m.id, proposed_ts, G_i) at process s:
+
+    record proposed_ts from G_i for m
+
+    if ricevuti ACK da tutti i gruppi in m.group:
+
+        candidate_final_ts = max(local_clock_s,
+                                 max(tutti i proposed_ts ricevuti))
+
+        # Il calcolo del final_ts è deterministico dato l'insieme di ACK,
+        # quindi non serve Paxos qui: s lo calcola e lo invia.
+        # (Anche se s fallisse subito dopo aver inviato qualche COMMIT,
+        # il valore di final_ts è già deciso e immutabile.)
+        final_ts = candidate_final_ts
+        local_clock_s = max(local_clock_s, final_ts) + 1
+
+        for each gruppo G_i in m.group:
+            for each replica p in G_i:
+                send (COMMIT, m.id, final_ts) to p
+
+
+# ─────────────────────────────────────────────────────────────────────
+# LATO RICEVENTE — COMMIT
+# Tutti i gruppi (G_s incluso) ratificano il final_ts via Paxos.
+# ─────────────────────────────────────────────────────────────────────
+
+upon receive (COMMIT, m.id, final_ts) at process p in group G_i:
+
+    if commit di m.id già appreso da G_i:
+        return
+
+    # ─ Paxos #2: G_i concorda sul commit ─
+    # Vedi "Protocollo_Paxos.txt" per il dettaglio dell'istanza.
+    decided_final_ts = paxos_propose((G_i, m.id, "commit_ts"), final_ts)
+
+    local_clock_p = max(local_clock_p, decided_final_ts) + 1
+
+    update m in pending_queue:
+        m.timestamp = decided_final_ts
+        m.status    = DELIVERABLE
+
+    while head(pending_queue).status == DELIVERABLE:
+        m = pop(pending_queue)
+        deliver(m)

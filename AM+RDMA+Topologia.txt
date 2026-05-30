@@ -1,0 +1,389 @@
+# ─────────────────────────────────────────────────────────────────────
+#	ATOMIC MULTICAST AD ALBERO (TRAM)
+#
+# Il seguente pseudocodice riporta l'implementazione di Atomic Multicast introdotta
+# nel paper "Scaling atomic ordering in shared memory" (TRAM = TRee-based Atomic Multicast).
+#
+# In breve, TRAM è una implementazione di Fault tolerant Atomic Multicast per il modello
+# a memoria condivisa (shared-memory) basata su RDMA, come RamCast. La differenza chiave
+# è l'architettura: invece di far coordinare tutti i gruppi destinatari tra loro (come in
+# Skeen/RamCast), TRAM organizza i gruppi in un ALBERO DI OVERLAY statico, noto in anticipo
+# a client e repliche. Ogni gruppo comunica SOLO con il proprio genitore (parent) e i propri
+# figli (children) nell'albero.
+#
+# A differenza di RamCast (che è GENUINE), TRAM è PARTIALLY GENUINE: per consegnare un
+# messaggio a più gruppi, l'ordinamento può coinvolgere anche gruppi INTERMEDI che non sono
+# tra i destinatari del messaggio (servono solo come "instradatori" lungo l'albero). Questo
+# semplifica molto il protocollo e lo rende più facile da ottimizzare, al costo della genuinità.
+#
+# L'idea di base combina tre ingredienti:
+#   1) ORDINAMENTO LOCALE AL GRUPPO tramite un meccanismo ispirato a Paxos, adattato alla
+#      memoria condivisa e ai permessi RDMA (come in RamCast). Ogni gruppo ha un Leader
+#      che impone l'ordine ai Follower (passivi) scrivendo direttamente nel loro LOG remoto.
+#   2) ORDINAMENTO TRA GRUPPI tramite l'albero: il "least common ancestor" (lca, antenato
+#      comune più basso) dei destinatari di un messaggio ordina quel messaggio, e l'ordine
+#      viene propagato verso il basso lungo l'albero. Poiché i buffer condivisi tra un gruppo
+#      genitore e un gruppo figlio sono letti/scritti in ordine FIFO, l'ordine stabilito da
+#      un genitore è automaticamente preservato dai figli.
+#   3) PERMESSI RDMA: come in RamCast, solo un processo alla volta può detenere il permesso
+#      di scrittura sul LOG di un altro processo. Quindi se un Leader riesce a scrivere in un
+#      quorum di repliche, SA di aver agito in isolamento (nessun altro Leader ha preso il suo
+#      posto) senza dover effettuare ulteriori controlli.
+#
+# VANTAGGIO PRESTAZIONALE dell'albero: una volta che l'lca ha ordinato un messaggio, tutti i
+# suoi figli possono elaborarlo IN PARALLELO (sfruttando le scritture RDMA parallele), e
+# sottoalberi diversi procedono indipendentemente.
+#
+# COME RAMCAST: nessun messaggio (send/receive) nel caso normale; tutta la comunicazione
+# avviene tramite SCRITTURE/LETTURE REMOTE su memoria condivisa, rilevate con meccanismo di polling.
+#
+# ─────────────────────────────────────────────────────────────────────
+
+
+
+# ─────────────────────────────────────────────────────────────────────
+# DEFINIZIONI PRELIMINARI (sull'albero di overlay T)
+# ─────────────────────────────────────────────────────────────────────
+#
+#   lca(T, dst)    = "least common ancestor": il gruppo più vicino alla radice di T da cui
+#                    si possono raggiungere TUTTI i gruppi in dst scendendo lungo l'albero.
+#   reach(g)       = "reach" di un gruppo g: l'insieme dei gruppi raggiungibili da g scendendo
+#                    nell'albero, g incluso (cioè il sottoalbero radicato in g).
+#   parent(g)      = il gruppo genitore di g nell'albero.
+#   children(g)    = l'insieme dei gruppi figli di g nell'albero.
+#
+# NOTA SUL MODELLO: ogni gruppo contiene n = 2f + 1 processi, dove f è il numero massimo di
+# processi che possono fallire per gruppo. Un QUORUM in un gruppo è un insieme di f + 1
+# processi. Si assume un oracolo di leader election DEBOLE: per ogni gruppo g, prima o poi
+# leader(g) restituisce sempre lo stesso processo corretto.
+
+
+
+# ─────────────────────────────────────────────────────────────────────
+# STRUTTURE DATI CONDIVISE
+# ─────────────────────────────────────────────────────────────────────
+#
+# Client e repliche comunicano tramite buffer condivisi. Per semplicità si assumono buffer
+# illimitati (Nell'implementazione pratica è utile usare un buffer circolare, dove uno slot può
+# essere liberato non appena è stato fatto il delivery del messaggio contenuto in esso. Il buffer
+# circolare è la struttura dati conveniente in ogni implementazione di Atomic Multicast).
+#
+# Ogni replica mantiene in memoria queste strutture CONDIVISE (accessibili da remoto):
+
+HM[0 .. |C|+1]					# HEADER/MESSAGE buffers: un array di buffer, uno per ogni
+						# client + uno aggiuntivo per il PARENT del gruppo.
+						# Ogni entry è una tupla ⟨c, id, dst, val⟩ dove:
+						#   c   = client che ha avviato il multicast
+						#   id  = identificatore unico (non nullo) del messaggio
+						#   dst = insieme dei gruppi destinatari
+						#   val = payload del messaggio
+						# È il buffer su cui il mittente (client o parent) SCRIVE.
+
+LOG						# Il LOG del gruppo (uno per replica). Ogni entry è una
+						# tupla ⟨tmp, source, slotout, hm⟩ dove:
+						#   tmp     = timestamp unico nel sistema, garantisce la
+						#             consistenza nel gruppo (≈ ballot di Paxos)
+						#   source  = id del client o del parent da cui proviene il msg
+						#   slotout = vettore: posizione nell'HM dei figli in cui il
+						#             messaggio è stato propagato verso il basso
+						#   hm      = copia del messaggio a cui l'entry si riferisce
+						#
+						# È il buffer PROTETTO: solo il Leader può scriverci (permessi RDMA).
+
+perm[ ]						# Array con un timestamp per ogni replica remota. Usato da una
+						# replica per CHIEDERE il permesso di diventare Leader proponendo
+						# un timestamp.
+
+permack[ ]					# Array di coppie ⟨tmp, ack⟩, una per replica remota. Conterrà il
+						# RISULTATO della richiesta di permesso per il timestamp tmp
+						# (ack ∈ {ACK, NACK}).
+
+
+# Ogni replica mantiene inoltre queste variabili PRIVATE:
+
+slotin[x]					# Puntatore al prossimo slot da LEGGERE dalla memoria di un input x
+						# (un client o il parent del gruppo).
+slotout[x]					# Puntatore al prossimo slot libero in cui SCRIVERE nella memoria del
+						# figlio x.
+FUO ← 0						# FIRST UNDECIDED OFFSET: punta alla prossima entry del LOG da decidere.
+STD ← 0						# SLOT TO DELIVER: punta alla prossima entry del LOG per cui gestire
+						# la consegna (delivery). Vale sempre STD ≥ FUO.
+tmp ← ⟨r, 0⟩					# Timestamp unico (coppia, ordinata come in RamCast).
+leader ← ⊥					# Stima locale di CHI sia il Leader corrente del gruppo.
+
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+#
+#		ALGORITMO 1 — IL CLIENT
+#
+# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+
+# Il client c invia in multicast un messaggio m. Prima calcola l'lca dei destinatari di m
+# usando la topologia dell'albero, poi scrive il messaggio DIRETTAMENTE (via RDMA write)
+# nella memoria delle SOLE repliche dell'lca (NON di tutti i destinatari!). Sarà poi
+# l'albero a propagare il messaggio verso il basso fino ai destinatari effettivi.
+# slot[x] punta al prossimo slot libero in ogni gruppo x.
+
+# --- Variabile del CLIENT c ---
+slot[g] ← 0   per ogni g ∈ Γ			# Prossimo slot libero presso ogni gruppo
+
+
+procedure MULTICAST(m = ⟨id, dst, val⟩)
+	lca = lca(T, m.dst)						# Calcolo l'antenato comune più basso dei destinatari
+	for each process p in lca
+		write(p, HM[c, slot[lca]], ⟨c, m.id, m.dst, m.val⟩)	# Scrivo il msg nel buffer dell'lca
+	slot[lca] = slot[lca] + 1					# Avanzo allo slot successivo
+
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+#
+#		ALGORITMO 2 — MAIN LOOP DELLA REPLICA (processo s nel gruppo g)
+#
+# Questo è il ciclo principale eseguito da ogni replica. Contiene sia la logica del Leader
+# (proporre l'ordine, consegnare, propagare ai figli) sia quella del Follower (consegnare
+# seguendo il Leader), sia la gestione delle richieste di permesso.
+#
+# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────
+# DIVENTARE LEADER (Step 2.1) (Le 3 funzioni commentate di seguito sono riportate a fine file)
+# ─────────────────────────────────────────────────────────────────────
+
+# Quando l'oracolo leader(g) indica QUESTA replica come Leader, ma essa non lo è ancora,
+# esegue tre fasi in sequenza:
+#   1) become_leader()  -> ottiene i permessi per scrivere nel LOG dei Follower
+#   2) group_catchup()  -> rende i LOG delle repliche mutuamente consistenti
+#   3) tree_catchup()   -> completa eventuali operazioni lasciate a metà dal Leader precedente
+#                          (es. propagazione ai figli non terminata)
+
+# Questa condizione si può verificare in 3 casi:
+# 1 - Quando starto il sistema
+# 2 - Quando crasha il leader precedente ed esiste una politica che indica autnomamente s come nuovo leader
+# 3 - Quando s fallisce nell'ottenere leadership e quindi deve riprovare
+
+when  leader(g) == s  AND  leader ≠ s						# {Step 2.1}
+	res = become_leader()						# Fase 1: raccolgo i permessi
+	FUO' = FUO							# Salvo il FUO prima del catchup (serve a tree_catchup)
+	if res == OK then  res = group_catchup()			# Fase 2: rendo i LOG consistenti
+	if res == OK then
+		tree_catchup(FUO')					# Fase 3: completo le operazioni del vecchio Leader
+		leader = s						# Divento ufficialmente Leader
+	else								# caso res == NOK
+		leader = ⊥						# Fallito: torno alla logica di Follower
+
+
+# ─────────────────────────────────────────────────────────────────────
+# LEADER: trova un messaggio, lo ordina, lo consegna e lo propaga ai figli
+#         (Step 2.2 → 2.3 → 2.4 → 2.5) 
+# ─────────────────────────────────────────────────────────────────────
+
+# Il Leader cerca nei propri buffer di input HM (uno per ogni client e per il parent) un
+# messaggio pronto da processare. Quando lo trova:
+#   2.3) lo ORDINA scrivendolo nel LOG di ogni replica del gruppo allo slot FUO. Se la
+#        scrittura riesce in un quorum, il messaggio è garantito ordinato (grazie ai permessi
+#        RDMA: se un quorum accetta la write, nessun altro Leader ha preso il controllo).
+#   2.4) se il proprio gruppo è destinatario, CONSEGNA il messaggio (delivery).
+#   2.5) PROPAGA il messaggio ai figli che hanno un destinatario nel proprio reach.
+
+when  leader == s  AND  ∃ y ∈ C ∪ {parent(g)} : HM[y, slotin[y]].id ≠ 0		# {Step 2.2}
+	hm = HM[y, slotin[y]]						# Leggo il messaggio dal buffer di input y
+	slotin[y] = slotin[y] + 1					# Avanzo il puntatore di lettura per y
+
+	count = 0							# {Step 2.3} — ORDINAMENTO
+	for each replica r in g
+		l = ⟨tmp, y, slotout, hm⟩				# Costruisco l'entry di LOG
+		res = write(r, LOG[FUO], l)				# La scrivo nel LOG di r allo slot FUO
+		if res == OK then
+			count = count + 1				# Conto le scritture andate a buon fine
+
+	if count > f then						# Se ho scritto in un QUORUM (f+1 repliche)...
+		STD = STD + 1						# {Step 2.4} — CONSEGNA DEL LEADER
+		if g ∈ hm.dst then					# Se il mio gruppo è destinatario...
+			deliver(hm.val)					# ...consegno il messaggio
+			
+		for each child group x in children(g)			# {Step 2.5} — PROPAGAZIONE AI FIGLI
+			if hm.dst ∩ reach(x) ≠ ∅ then			# Se il figlio x porta verso un destinatario...
+				for each process p in x
+					write(p, HM[g, slotout[x]], hm)	# ...scrivo il msg nel buffer di x
+				slotout[x] = slotout[x] + 1
+		FUO = FUO + 1						# Avanzo al prossimo slot da decidere
+	else
+		leader = ⊥						# Quorum non raggiunto: un altro Leader ha preso il
+									# controllo (permessi revocati) -> torno Follower
+
+
+# ─────────────────────────────────────────────────────────────────────
+# FOLLOWER: consegna seguendo l'attività del Leader (Step 2.6)
+# ─────────────────────────────────────────────────────────────────────
+
+# I Follower scrutano (polling) il proprio LOG per rilevare l'attività del Leader. Quando un
+# Follower trova messaggi SIA nello slot STD SIA nello slot STD+1, può consegnare in sicurezza
+# il messaggio in STD. Questo funziona perché il Leader scrive lo slot i+1 solo DOPO aver
+# ordinato (scritto in un quorum) il messaggio nello slot i: quindi la presenza di STD+1
+# garantisce che STD sia stato deciso. (Stessa logica "i+1 conferma i" di Mu.)
+
+when  leader ≠ s  AND  LOG[STD .. STD+1].id ≠ 0					# {Step 2.6}
+	l = LOG[STD]							# Leggo l'entry da consegnare
+	slotin[l.source] = slotin[l.source] + 1				# Avanzo il puntatore di input relativo
+	STD = STD + 1							# Avanzo lo Slot To Deliver
+	if g ∈ l.hm.dst then						# Se il mio gruppo è destinatario...
+		deliver(l.hm.val)					# ...consegno il messaggio
+
+
+# ─────────────────────────────────────────────────────────────────────
+# OGNI REPLICA: gestione delle richieste di permesso (Step 2.7)
+# ─────────────────────────────────────────────────────────────────────
+
+# Periodicamente, le repliche controllano se un candidato Leader ha richiesto un permesso
+# (scrivendo un timestamp in perm[]). Una replica CONCEDE il permesso e risponde con ACK se
+# il candidato propone un timestamp MAGGIORE del più grande mai ricevuto (come nella fase 1
+# di Paxos); altrimenti risponde NACK.
+
+periodically do									# {Step 2.7}
+	for each replica r in g
+		ts = perm[r]						# Leggo l'eventuale richiesta di r
+		perm[r] = ⟨0, 0⟩					# Consumo la richiesta
+		if ts > tmp then					# Timestamp più grande di quello visto finora?
+			tmp = ts					# Aggiorno il mio timestamp massimo
+			perm_revoke(leader)				# REVOCO il permesso al vecchio Leader
+			perm_grant(r)					# CONCEDO il permesso al candidato r
+			write(r, permack[s], ⟨ts, ACK⟩)		# Rispondo con ACK
+			leader = r					# Aggiorno la mia stima del Leader
+		if ts < tmp then					# Timestamp troppo vecchio?
+			write(r, permack[s], ⟨ts, NACK⟩)		# Rispondo con NACK
+
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+#
+#		PROCEDURA become_leader()  (candidato s nel gruppo g)
+#
+# Quando una replica tenta di diventare Leader, prima richiede il permesso di aggiornare il
+# LOG delle repliche. È l'equivalente della FASE 1 di Paxos.
+#
+# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+
+function become_leader()
+	# {Step 3.1} — PROPONGO UN TIMESTAMP
+	increment(tmp)							# Scelgo un timestamp unico, più grande di ogni
+									# timestamp proposto in precedenza
+	for each replica r in g
+		write(r, perm[r], tmp)					# Scrivo la proposta in perm[] di ogni replica
+
+	# {Step 3.2} — ASPETTO LE RISPOSTE
+	repeat
+		Q_ACK  = ∅
+		Q_NACK = ∅
+		for each replica r in g					# Le repliche rispondono in Step 2.7
+			if permack[r].ts == tmp then			# Considero solo le risposte al MIO timestamp
+				if permack[r].ack == ACK then
+					Q_ACK = Q_ACK ∪ {r}		# Raccolgo gli ACK
+				else
+					Q_NACK = Q_NACK ∪ {r}		# Raccolgo i NACK
+	until |Q_ACK| + |Q_NACK| > f					# Aspetto un quorum di risposte (positive o negative)
+
+	# {Step 3.3} — VERIFICO GLI ACK
+	if |Q_ACK| ≥ f + 1 then						# Se ho un QUORUM di ACK positivi...
+		return OK						# ...posso assumere di essere il Leader corrente
+	return NOK
+
+# NOTA: anche se più repliche tentano di diventare Leader simultaneamente, AL PIÙ UNA avrà i
+# permessi corretti per scrivere in un quorum di repliche e quindi per ordinare un messaggio.
+
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+#
+#		PROCEDURA group_catchup()  (processo s nel gruppo g)
+#
+# Una volta ottenuti i permessi, il nuovo Leader deve assicurarsi che i LOG delle repliche
+# siano CONSISTENTI tra loro (recuperando eventuali decisioni del Leader precedente). È
+# l'equivalente della FASE 2 di Paxos, applicata slot per slot a partire da FUO.
+#
+# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+
+function group_catchup()
+	loop
+		# {Step 4.1} — LEGGO I LOG REMOTI
+		count = 0
+		L = ∅
+		for each replica r in g
+			res = read(r, LOG[FUO], l)			# Leggo l'entry FUO dal LOG di r
+			if res ≠ OK then
+				count = count + 1			# Conto le letture fallite
+			else
+				L = L ∪ {l}				# Raccolgo le entry lette
+		if count > f then  return NOK				# Se non leggo da un quorum, un nuovo Leader ha
+									# preso il controllo (permessi revocati) -> esco
+
+		# {Step 4.2} — CONTROLLO I TIMESTAMP
+		lv = maxtmp(L)						# Scelgo l'entry col timestamp MASSIMO tra quelle lette
+		if lv.tmp == 0 then  return OK				# Nessun timestamp -> slot non ancora deciso,
+									# il LOG è consistente: ho finito
+
+		# {Step 4.3} — REPLICO L'ENTRY
+		count = 0
+		lv.tmp = tmp						# Riscrivo l'entry col MIO timestamp
+		for each replica r in g
+			res = write(r, LOG[FUO], lv)			# Replico l'entry vincente nel LOG di ogni replica
+			if res ≠ OK then
+				count = count + 1
+		if count > f then  return NOK				# Se non scrivo in un quorum -> nuovo Leader, esco
+
+		# {Step 4.4} — GESTISCO LA CONSEGNA
+		if FUO > STD then					# Lo slot FUO è ora deciso...
+			STD = STD + 1
+			if g ∈ lv.hm.dst then				# ...se il mio gruppo è destinatario...
+				deliver(lv.hm.val)			# ...consegno il messaggio
+
+		# {Step 4.5} — AVANZO
+		FUO = FUO + 1						# Passo al prossimo slot del LOG
+
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+#
+#		PROCEDURA tree_catchup(FUO')  (processo s nel gruppo g)
+#
+# Oltre a sistemare i LOG all'interno del proprio gruppo (group_catchup), il nuovo Leader
+# deve completare le operazioni lasciate a metà dal Leader precedente VERSO L'ESTERNO, cioè
+# l'aggiornamento dei FIGLI nell'albero. Infatti il vecchio Leader potrebbe aver ordinato un
+# messaggio nel LOG ma essere crashato PRIMA di propagarlo ai figli.
+#
+# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+
+function tree_catchup(FUO')
+	# {Step 5.1} — AGGIORNO I PUNTATORI DI INPUT
+	for each input x in C ∪ {parent(g)}				# Per ogni input (client e parent)...
+		last = max({ i : LOG[i].source == x })			# Trovo l'ultimo slot di LOG proveniente da x
+		slotin[x] = (i + 1 : HM[i].id == LOG[last].id)		# Lo slot in HM[x] con lo stesso id è l'ultimo
+									# consumato: mi posiziono al successivo
+
+	# {Step 5.2} — RIESEGUO LA LOGICA DI MULTICAST
+	# Poiché il vecchio Leader potrebbe essere stato faulty, non c'è garanzia che i valori nel
+	# LOG siano stati replicati ai figli. Riesguo quindi la propagazione per ogni slot di LOG
+	# a partire dal valore di FUO PRIMA del failover (FUO').
+	for each last in [FUO' .. FUO-1]
+		l_last = LOG[last]
+		for each child group x in children(g)
+			slotout[x] = l_last.slotout[x]			# Recupero il puntatore di output salvato nel LOG
+
+			# {Step 5.3} — RI-REPLICO SUI FIGLI
+			if l_last.hm.dst ∩ reach(x) ≠ ∅ then		# Se il figlio x porta verso un destinatario...
+				for each process p in x
+					write(p, HM[g, slotout[x]], l_last.hm)	# ...riscrivo l'entry nel buffer di x
+				slotout[x] = slotout[x] + 1
+

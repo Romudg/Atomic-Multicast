@@ -1,0 +1,56 @@
+# IN QUESTA VERSIOONE VANILLA DI ATOMIC MULTICAST, IL GRUPPO VIENE VISTO COME UN SINGOLO PROCESSO.
+# QUESTA IMPLEMENTAZIONE BASILARE NON PERMETTE DI GESTIRE FAULT, QUINDI SE UN PROCESSO FALLISCE ALLORA
+# L'ALGORITMO FALLISCE.
+
+// ─── SENDER ───
+struct messaggio{	
+	id,		# id messaggio (composto dalla coppia {#processo, num_seq})
+	G,		# Gruppi (processi) destinatari
+	ts,		# Timestamp
+	status;		# Stato (PROPOSE, ACK, COMMIT)
+}
+		
+
+procedure SEND(m, G):
+    m.id     = (self, seq_num++)	-->	# L'ID è una coppia {sender, seq_num}, necessaria per distinguere il caso in cui due processi provino ad 						# inviare un messaggio contemporaneamente con lo stesso seq_num.
+						# I gruppi (processi) devono essere ordinati, ovvero se si hanno due messaggi del tipo 
+						m1.ID = (Pi, 1) e m2.ID = (Pj, 1) deve esistere un ordine che da sempre priorita allo stesso prcesso. 
+ 
+    m.group  = G			-->     # Indica i gruppi destinatari del messaggio	
+    send (PROPOSE, m) to all p in G	-->	# Invia il messaggio PROPOSE : Questo messaggio serve a notificare gli altri processi dell'intenzione di 						# inviare un messaggio
+
+
+// ─── ogni processo p in G ───
+
+upon receive (PROPOSE, m):			# Quando ricevi una proposta
+    local_clock = local_clock + 1		# Incrementa clock_locale
+    proposed_ts = local_clock
+
+    add m to pending_queue with:		# Aggiungi m alla lista dei messaggi in attesa
+        m.timestamp = proposed_ts		# proponi il timestamp
+        m.status    = UNDELIVERABLE		# m non è ancora pronto per il deliver
+
+    send (ACK, m.id, proposed_ts) to m.sender	# Invia ACK con proposta del timestamp SOLO al sender
+
+
+// ─── il sender raccoglie le ACK ───
+
+upon receive all ACKs for m:						# Una volta ottenuti tutti gli ACK
+    local_clock = local_clock + 1
+    final_ts = max(local_clock, max(tutti i proposed_ts ricevuti))	# Il timestamp definitivo è il massimo tra tutti i timestamp proposti
+    send (COMMIT, m.id, final_ts) to all p in G 			# Il sender invia il COMMIT a tutti i destinatari con il timestamp definito
+
+
+// ─── ogni processo p in G ───
+
+upon receive (COMMIT, m.id, final_ts):				# Quando ricevi COMMIT
+    local_clock = max(local_clock, final_ts) + 1		# Il clock_locale viene aggiornato al valore del messaggio di cui è fatto il commit
+								# (In questo modo se arrivano nuovi messaggi ottengono sempre timestamp superiore)
+    update m in pending_queue:					# Aggiorna timestamp e stato del messaggio
+        m.timestamp = final_ts
+        m.status    = DELIVERABLE
+
+    while head(pending_queue).status == DELIVERABLE:		# Delivery del messaggio di un processo verso l'applicazione a cui è destinato 
+        m = pop(pending_queue)
+        deliver(m)
+
