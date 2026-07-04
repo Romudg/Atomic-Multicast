@@ -1,7 +1,7 @@
 This repository offers the pseudocode for different solutions to implement Atomic Multicast.
 
 The different files contain different 'levels' of the algoritm, from the vanilla version (Skeen's protocol), to 
-the versions that are optimized for protocol and network typology.
+the versions that are optimized for protocol and network topology.
 
 In particular:
 
