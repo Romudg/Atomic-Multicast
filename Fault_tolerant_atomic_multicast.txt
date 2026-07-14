@@ -16,8 +16,8 @@
 
 struct messaggio {
     id,             # (sender_process, seq_num) — il sender è un PROCESSO
-    G,              # insieme dei gruppi destinatari (G_s ∈ G implicitamente)
-    ts,
+    dst,              # insieme dei gruppi destinatari (G_s ∈ G implicitamente)
+    timestamp,
     status;
 }
 
@@ -28,17 +28,17 @@ struct messaggio {
 
 procedure SEND(m, G):
     m.id    = (s, seq_num_s++)         # seq_num locale del processo s
-    m.group = G ∪ {G_s}                # G_s viene incluso tra i destinatari
+    m.dst = G ∪ {G_s}                # G_s viene incluso tra i destinatari
 
     # Invio diretto a tutte le repliche di tutti i gruppi coinvolti.
     # Anche il gruppo G_s (ovverio il gruppo a cui appartiene il sender) riceve il messaggio
-    for each gruppo G_i in m.group:
+    for each gruppo G_i in m.dst:
         for each replica p in G_i:
             send (PROPOSE, m) to p
 
 
 # ─────────────────────────────────────────────────────────────────────
-# LATO RICEVENTE — vale per OGNI gruppo G_i in m.group, G_s incluso
+# LATO RICEVENTE — vale per OGNI gruppo G_i in m.dst, G_s incluso
 # Tutti i gruppi eseguono Paxos #1 IN PARALLELO.
 # ─────────────────────────────────────────────────────────────────────
 
@@ -68,7 +68,7 @@ upon receive (PROPOSE, m) at process p in group G_i:
 
 # ─────────────────────────────────────────────────────────────────────
 # IL SENDER s RACCOGLIE GLI ACK
-# s raccoglie un ACK per ogni gruppo in m.group (incluso il proprio G_s,
+# s raccoglie un ACK per ogni gruppo in m.dst (incluso il proprio G_s,
 # che ora si comporta come un gruppo destinatario qualunque).
 # ─────────────────────────────────────────────────────────────────────
 
@@ -76,7 +76,7 @@ upon receive (ACK, m.id, proposed_ts, G_i) at process s:
 
     record proposed_ts from G_i for m
 
-    if ricevuti ACK da tutti i gruppi in m.group:
+    if ricevuti ACK da tutti i gruppi in m.dst:
 
         candidate_final_ts = max(local_clock_s,
                                  max(tutti i proposed_ts ricevuti))
@@ -88,7 +88,7 @@ upon receive (ACK, m.id, proposed_ts, G_i) at process s:
         final_ts = candidate_final_ts
         local_clock_s = max(local_clock_s, final_ts) + 1
 
-        for each gruppo G_i in m.group:
+        for each gruppo G_i in m.dst:
             for each replica p in G_i:
                 send (COMMIT, m.id, final_ts) to p
 
