@@ -105,10 +105,10 @@ slotin[x]					# Puntatore al prossimo slot da LEGGERE dalla memoria di un input 
 						# (un client o il parent del gruppo).
 slotout[x]					# Puntatore al prossimo slot libero in cui SCRIVERE nella memoria del
 						# figlio x.
-FUO ← 0						# FIRST UNDECIDED OFFSET: punta alla prossima entry del LOG da decidere.
+FUO ← 0						# FIRST UNDECIDED OFFSET: punta alla prossima entry del LOG da decidere (analogo al FUS di RamCast).
 STD ← 0						# SLOT TO DELIVER: punta alla prossima entry del LOG per cui gestire
 						# la consegna (delivery). Vale sempre STD ≥ FUO.
-tmp ← ⟨r, 0⟩					# Timestamp unico (coppia, ordinata come in RamCast).
+tmp ← ⟨0, s⟩					# Timestamp unico (coppia ⟨contatore, id processo⟩, ordinata come in RamCast).
 leader ← ⊥					# Stima locale di CHI sia il Leader corrente del gruppo.
 
 
@@ -229,7 +229,7 @@ when  leader == s  AND  ∃ y ∈ C ∪ {parent(g)} : HM[y, slotin[y]].id ≠ 0	
 # ordinato (scritto in un quorum) il messaggio nello slot i: quindi la presenza di STD+1
 # garantisce che STD sia stato deciso. (Stessa logica "i+1 conferma i" di Mu.)
 
-when  leader ≠ s  AND  LOG[STD .. STD+1].id ≠ 0					# {Step 2.6}
+when  leader ≠ s  AND  LOG[STD].tmp ≠ 0  AND  LOG[STD+1].tmp ≠ 0					# {Step 2.6}
 	l = LOG[STD]							# Leggo l'entry da consegnare
 	slotin[l.source] = slotin[l.source] + 1				# Avanzo il puntatore di input relativo
 	STD = STD + 1							# Avanzo lo Slot To Deliver
@@ -369,7 +369,7 @@ function tree_catchup(FUO')
 	# {Step 5.1} — AGGIORNO I PUNTATORI DI INPUT
 	for each input x in C ∪ {parent(g)}				# Per ogni input (client e parent)...
 		last = max({ i : LOG[i].source == x })			# Trovo l'ultimo slot di LOG proveniente da x
-		slotin[x] = (i + 1 : HM[i].id == LOG[last].id)		# Lo slot in HM[x] con lo stesso id è l'ultimo
+		slotin[x] = (i + 1 : HM[x, i].id == LOG[last].hm.id)		# Lo slot in HM[x] con lo stesso id è l'ultimo
 									# consumato: mi posiziono al successivo
 
 	# {Step 5.2} — RIESEGUO LA LOGICA DI MULTICAST
