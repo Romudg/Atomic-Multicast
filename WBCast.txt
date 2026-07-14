@@ -15,6 +15,11 @@
 # facendo sì che solamente il Leader possa decidere il valore del timestamp mentre i 
 # Follower sono costretti a seguire le direttive del leader (non hanno potere decisionale).
 #
+# NOTA SULLA NOMENCLATURA (per coerenza con le altre versioni):
+#   - LocalTS (Lts)  corrisponde al proposed_ts delle versioni Vanilla e Skeen+Paxos
+#   - GlobalTS (Gts) corrisponde al final_ts delle versioni Vanilla e Skeen+Paxos
+#   - m.dst è l'insieme dei gruppi destinatari (stesso nome usato in RamCast e TRAM)
+#
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -25,7 +30,7 @@
 clock ← 0 ∈ N   				# TIENE CONTO DEL TEMPO
 Phase[ ] ← (λk. START) ∈  			
 M → {START, PROPOSED, ACCEPTED, COMMITTED}	# LA FASE INDICA IN CHE STATO DI ELABORAZIONE SI TROVA UN MESSAGGIO
-LocalTS[ ] ∈ M → (N × G)			# VETTORE DI Lts PER I MESSAGGI
+LocalTS[ ][ ] ∈ (M × G) → (N × G)		# MATRICE DI Lts: LocalTS[m][g] è il Lts proposto dal gruppo g per il messaggio m
 GlobalTS[ ] ∈ M → (N × G)			# VETTORE DI Gts PER I MESSAGGI
 Delivered ← (λk. FALSE) ∈ M → {FALSE, TRUE}	# INDICA SE SIA STATO EFFETTUATO IL DELIVER (Diventa True non appena si determina il Gts)
 status ∈ {LEADER, FOLLOWER, RECOVERING}		# INDICA IL RUOLO DI OGNI PROCESSO NEL GRUPPO
@@ -36,7 +41,7 @@ max_delivered_gts ← ⊥ ∈ (N × G) ∪ {⊥} 		# SERVE A TENERE TRACCIA DEL 
 
 
 
-## localTS e globalTS sono matrici !! 	Ogni processo mantiene anche tutti i vettori di tutti gli altri nodi nel sistema
+## LocalTS e GlobalTS sono matrici !! 	Ogni processo mantiene anche tutti i vettori di tutti gli altri nodi nel sistema
 ## Anche se questa soluzione non è efficiente dal punto di vista della memoria occupata, è necessaria se si vuole diminuire la latenza e allo stesso tempo
 ## garantire il recovery				
 
@@ -48,8 +53,8 @@ max_delivered_gts ← ⊥ ∈ (N × G) ∪ {⊥} 		# SERVE A TENERE TRACCIA DEL 
 # ─────────────────────────────────────────────────────────────────────
 
 procedure SEND (m, G)
-	m.id = (seq_num, pi)
-	m.group = G					# Con G intendiamo l'insieme dei gruppi riceventi			
+	m.id = (p_i, seq_num++)			# ID = coppia {processo, num_seq}, stesso ordine delle altre versioni
+	m.dst = G				# Con G intendiamo l'insieme dei gruppi riceventi			
 	
 	for each group g_i in G
 		send(PROPOSE, m) to Cur_leader[g_i] 	# Il messaggio di PROPOSTA viene inviato solamente ai 
@@ -59,61 +64,66 @@ procedure SEND (m, G)
 # RECEIVING LEADER
 # ─────────────────────────────────────────────────────────────────────
 
-upon receive (PROPOSE,m) to process p in g_i		# Se tutto funziona correttamente solo il processo leader deve ricevere il messaggio
-	if (status == Leader) then			# Mi assicuro di essere il leader
-		if (phase[m] == START) then
+upon receive (PROPOSE, m) to process p in g_i		# Se tutto funziona correttamente solo il processo leader deve ricevere il messaggio
+	if (status == LEADER) then			# Mi assicuro di essere il leader
+		if (Phase[m] == START) then
 			clock = clock+1
-			localTS[m] = (clock, g_i)
+			LocalTS[m][g_i] = (clock, g_i)
 			Phase[m] = PROPOSED
 		
-		send(ACCEPT, m, g_i, cballot, localTS[m]) to m.group  	# Per velocizzare l'algoritmo, invio il messaggio di ACCEPT (con il localTS necessario
-								  	# per il calcolo del globalTS) direttamente a tutti i destinatari
+		send(ACCEPT, m, g_i, cballot, LocalTS[m][g_i]) to m.dst	# Per velocizzare l'algoritmo, invio il messaggio di ACCEPT (con il LocalTS necessario
+									# per il calcolo del GlobalTS) direttamente a tutti i destinatari
 								# In questo modo non necessito del messaggio che il Leader dovrebbe inviare al proprio
 								# Follower (questo è il procedimento seguito ad esempio in altri approcci; e.g. FastCast)	
-							 # Questo permette a tutti i processi di aggiornare il procìprio clock al valore corretto 
+							 # Questo permette a tutti i processi di aggiornare il proprio clock al valore corretto 
 							 # in un solo scambio
 	
 # ─────────────────────────────────────────────────────────────────────
 # RECEIVER (EVERY PROCESS)
 # ─────────────────────────────────────────────────────────────────────
 
-upon receive (ACCEPT, m, g, Bal[g], Lts[g]) to process p in m.group
-    for every g in m.group
-	if ((status == Leader || status == Follower) AND cballot = Bal[g_i]) then	# Verifico di avere il ballot allineato con quello del gruppo e di non
-											# Essere in fase di recovery
+# g_i è il gruppo il cui Leader ha inviato questo ACCEPT (l'handler scatta una volta
+# per ogni ACCEPT ricevuto, cioè una volta per ogni gruppo destinatario).
+
+upon receive (ACCEPT, m, g_i, Bal[g_i], Lts[g_i]) to process p in m.dst
+	if ((status == LEADER || status == FOLLOWER) AND cballot == Bal[g_i]) then	# Verifico di avere il ballot allineato con quello del gruppo e di non
+											# essere in fase di recovery
 		if (Phase[m] == START || Phase[m] == PROPOSED) then
 			Phase[m] = ACCEPTED;
 		
-	localTS[m] = Lts[g_i]							# Salvo tutti i valori di LTS ricevuti dai vari nodi
-	clock = max {localTS[g_i] | g_i in m.group}
+	LocalTS[m][g_i] = Lts[g_i]					# Salvo il Lts ricevuto dal gruppo g_i (LocalTS è una matrice: messaggio × gruppo)
+	clock = max(clock, time(Lts[g_i]))				# Aggiorno il clock al valore del Lts ricevuto
 	
-	for g_i in m.group
-		send (ACCEPT_ACK, m, g_i, Bal[g_i]) to Leader(Bal[g_i])		#
+	for each g_j in m.dst
+		send (ACCEPT_ACK, m, g_j, Bal[g_j]) to Leader(Bal[g_j])	# ACK verso i Leader di TUTTI i gruppi destinatari: ogni Leader
+									# deve poter verificare che un quorum di ogni gruppo abbia accettato
 
 # ─────────────────────────────────────────────────────────────────────
-# RECEIVING LEADER
+# RECEIVING LEADER (processo p, Leader del gruppo g_i)
 # ─────────────────────────────────────────────────────────────────────
 
+# Il Leader può calcolare il GlobalTS solo quando, per OGNI gruppo destinatario g_j,
+# ha ricevuto l'ACCEPT_ACK da un quorum di processi di g_j.
 
-upon receive (ACCEPT_ACK, m, g, Bal) from a quorum of p_j in g		# In un sistema dove ogni processo è replicato 2f+1 volte
-    for every g in m.group						# per quorum si intende almeno f+1 processi che danno l'ACK
-	if (status == LEADER AND cballot == Bal[g_i]) then
-		GlobalTS[m] = max{Lts[g] | g in m.group}
+upon receive (ACCEPT_ACK, m, g_j, Bal[g_j]) from a quorum of p_k in g_j,	# In un sistema dove ogni processo è replicato 2f+1 volte
+     for every group g_j in m.dst						# per quorum si intende almeno f+1 processi che danno l'ACK
+	if (status == LEADER AND cballot == Bal[g_i]) then			# g_i = il mio gruppo: verifico il mio ballot corrente
+		GlobalTS[m] = max{ LocalTS[m][g_j] | g_j in m.dst }
 		Phase[m] = COMMITTED
 		
 		# Provo a consegnare uno o più messaggi committed, in ordine di GlobalTS
 		# Un messaggio m' può essere consegnato solo se tutti i messaggi m'' in fase
-		# PROPOSED o ACCEPTED hanno LocalTS[m''] > GlobalTS[m']
+		# PROPOSED o ACCEPTED hanno LocalTS[m''][g_i] > GlobalTS[m']
 		# (stessa logica di Skeen: evito di consegnare se potrebbe arrivare un messaggio
 		# con timestamp minore ancora in volo)
 		
 		for each m' such that:
 			Phase[m'] == COMMITTED AND
 			Delivered[m'] == FALSE AND
-			for all m'': Phase[m''] in {PROPOSED, ACCEPTED} => LocalTS[m''] > GlobalTS[m'] ordered by GlobalTS[m'] do
+			for all m'': Phase[m''] in {PROPOSED, ACCEPTED} => LocalTS[m''][g_i] > GlobalTS[m'] ordered by GlobalTS[m'] do
 		    
 			Delivered[m'] = TRUE
-			send(DELIVER, m', cballot, LocalTS[m'], GlobalTS[m']) to g_i
+			send(DELIVER, m', cballot, LocalTS[m'][g_i], GlobalTS[m']) to g_i
 							# Il leader invia il messaggio DELIVER a tutti i processi
 							# del proprio gruppo, incluso sé stesso
 
@@ -129,7 +139,7 @@ upon receive (DELIVER, m, b, lts, gts) to process p in g_i
 							# in seguito a crash del leader
 		
 		Phase[m] = COMMITTED			# Ogni processo salva tutte le informazioni che gli vengono inviate dal proprio Leader
-		LocalTS[m] = lts			# In questo modo è sempre possibile effettuare il recovery dello stao precedente se il Leader crasha.
+		LocalTS[m][g_i] = lts			# In questo modo è sempre possibile effettuare il recovery dello stato precedente se il Leader crasha.
 		GlobalTS[m] = gts
 		clock = max(clock, time(gts))
 		max_delivered_gts = gts
@@ -149,7 +159,7 @@ upon receive (DELIVER, m, b, lts, gts) to process p in g_i
 
 # Un altra tecnica utilizzabile sarebbe LSS (Leader Selection Service) 
 
-#Ovviamente lo scambio dei seuenti messaggi avviene tra processi appartenenti allo stesso gruppo
+#Ovviamente lo scambio dei seguenti messaggi avviene tra processi appartenenti allo stesso gruppo
 
 ########################## ───────────────────────── ##########################
 ########################## ───────────────────────── ##########################
@@ -181,7 +191,7 @@ upon receive (NEWLEADER_ACK, b, cballot(p_j), clock(p_j), Phase(p_j), LocalTS(p_
 		for each message m:
 			if exists p_j such that Phase(p_j)[m] == COMMITTED then
 				Phase[m] = COMMITTED				# Se qualcuno ha già committato m, lo marco tale
-				LocalTS[m] = LocalTS(p_j)[m]
+				LocalTS[m] = LocalTS(p_j)[m]			# (copio l'intera riga della matrice: i Lts di tutti i gruppi per m)
 				GlobalTS[m] = GlobalTS(p_j)[m]
 			else if exists p_j in J such that Phase(p_j)[m] == ACCEPTED then
 				Phase[m] = ACCEPTED				# Altrimenti recupero l'ultimo ACCEPTED dal ballot più recente
@@ -209,28 +219,8 @@ upon receive (NEWSTATE_ACK, b)
 		# (il follower usa max_delivered_gts per ignorare i duplicati)
 		for each m' such that:
 			Phase[m'] == COMMITTED AND
-			for all m'': Phase[m''] == ACCEPTED => LocalTS[m''] > GlobalTS[m']
+			for all m'': Phase[m''] == ACCEPTED => LocalTS[m''][g_i] > GlobalTS[m']
 		    ordered by GlobalTS[m'] do
 		    
 			Delivered[m'] = TRUE
-			send(DELIVER, m', cballot, LocalTS[m'], GlobalTS[m']) to g_i
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+			send(DELIVER, m', cballot, LocalTS[m'][g_i], GlobalTS[m']) to g_i
