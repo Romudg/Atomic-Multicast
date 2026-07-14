@@ -146,7 +146,7 @@ upon receive (ACCEPTED, inst, b, v) at leader L of G_i:
 upon receive (DECIDED, inst, v) at replica p:
     	state[inst].decided_value = v
     	local_clock_p = max(local_clock_p, v)
-    	update m in pending_queue with ts = v, status = UNDELIVERABLE
+    	update m in pending_queue with m.timestamp = v, m.status = UNDELIVERABLE
 
 
 # ─────────────────────────────────────────────────────────────────────
