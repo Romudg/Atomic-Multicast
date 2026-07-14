@@ -5,9 +5,9 @@
 // ─── SENDER ───
 struct messaggio{	
 	id,		# id messaggio (composto dalla coppia {#processo, num_seq})
-	G,		# Gruppi (processi) destinatari
-	ts,		# Timestamp
-	status;		# Stato (PROPOSE, ACK, COMMIT)
+	dst,		# Gruppi (processi) destinatari
+	timestamp,		# Timestamp
+	status;		# Stato (UNDELIVERABLE, DELIVERABLE). NB: PROPOSE/ACK/COMMIT sono tipi di messaggio, non stati
 }
 		
 
@@ -16,7 +16,7 @@ procedure SEND(m, G):
 						# I gruppi (processi) devono essere ordinati, ovvero se si hanno due messaggi del tipo 
 						m1.ID = (Pi, 1) e m2.ID = (Pj, 1) deve esistere un ordine che da sempre priorita allo stesso prcesso. 
  
-    m.group  = G			-->     # Indica i gruppi destinatari del messaggio	
+    m.dst  = G			-->     # Indica i gruppi destinatari del messaggio	
     send (PROPOSE, m) to all p in G	-->	# Invia il messaggio PROPOSE : Questo messaggio serve a notificare gli altri processi dell'intenzione di 						# inviare un messaggio
 
 
@@ -30,7 +30,7 @@ upon receive (PROPOSE, m):			# Quando ricevi una proposta
         m.timestamp = proposed_ts		# proponi il timestamp
         m.status    = UNDELIVERABLE		# m non è ancora pronto per il deliver
 
-    send (ACK, m.id, proposed_ts) to m.sender	# Invia ACK con proposta del timestamp SOLO al sender
+    send (ACK, m.id, proposed_ts) to m.sender	# Invia ACK con proposta del timestamp SOLO al sender (il sender e' la prima componente di m.id)
 
 
 // ─── il sender raccoglie le ACK ───
