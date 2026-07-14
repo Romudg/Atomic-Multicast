@@ -56,7 +56,7 @@ M[c,i].ptr[g, 1..n]				# VETTORE DI INDIRIZZI: per ogni gruppo g destinatario,
 M[c,i].ack[g, 1..n]				# VETTORE DI ACK: per ogni gruppo g, raccoglie il
 						# riconoscimento del timestamp da parte dei processi di g
 						# (ogni processo scrive qui il proprio round come ACK)
-M[c,i].tmp					# il timestamp di m, inizialmente ⊥
+M[c,i].tmp					# il timestamp FINALE di m (≈ GlobalTS/Gts di WBCast), inizialmente ⊥
 M[c,i].stat					# STATO di m, può essere:
 						#   ⊥        -> slot vuoto / non usato
 						#   MCAST    -> messaggio scritto, in attesa di ordinamento
@@ -66,7 +66,7 @@ M[c,i].stat					# STATO di m, può essere:
 
 # --- Contenuto di uno slot del Timestamp buffer T[c, i] ---
 T[c,i].tmp[1..k]				# VETTORE DI TIMESTAMP: tmp[g] contiene il timestamp
-						# proposto dal Leader del gruppo g per questo messaggio
+						# proposto dal Leader del gruppo g per questo messaggio (≈ LocalTS/Lts di WBCast)
 T[c,i].rnd[1..k]				# VETTORE DI ROUND: rnd[g] è il round del Leader di g
 						# (inizialmente (0,0)). Analogo al "ballot" di Paxos/WBCast,
 						# serve a tracciare chi sia il Leader corrente del gruppo g.
@@ -172,7 +172,7 @@ when ∃c, i : M[c,i].stat == MCAST  AND  T[c,i].rnd[g] == Round[g]		# {Task 3}
 	clock = max(clock, time(T[c,i].tmp[g]))					# Aggiorno il mio clock al timestamp del Leader
 	for each group h in M[c,i].dst, for each process q in h
 		j = M[c,i].ptr[q]						# Trovo lo slot corretto presso q
-		write(q, M[c,j].ack[p], Round[g])				# ACK: scrivo il mio round nel buffer di ogni
+		write(q, M[c,j].ack[g, p], Round[g])				# ACK: scrivo il mio round nel buffer di ogni
 										# destinatario per segnalare "ho accettato questo ts"
 
 
@@ -206,11 +206,11 @@ when ∃c, i, h : M[c,i].stat == MCAST  AND  T[c,i].rnd[h] == Round[h]  AND  h �
 # Quando questo vale per TUTTI i gruppi destinatari, il messaggio diventa ORDERED.
 
 upon ∃c, i, h : M[c,i].stat == MCAST  AND						# {Task 5}
-     ∃ quorum Q in h : for each q in Q : M[c,i].ack[q] == Round[h]
+     ∃ quorum Q in h : for each q in Q : M[c,i].ack[h, q] == Round[h]
 	M[c,i].tmp = max(M[c,i].tmp, T[c,i].tmp[h])				# Timestamp finale = max dei timestamp dei gruppi
 
 	if  for each group h in M[c,i].dst :					# Se OGNI gruppo destinatario ha raggiunto
-	    ∃ quorum Q in h : for each q in Q : M[c,i].ack[q] == Round[h]  then	# un quorum di ACK...
+	    ∃ quorum Q in h : for each q in Q : M[c,i].ack[h, q] == Round[h]  then	# un quorum di ACK...
 		M[c,i].stat = ORDERED						# ...il messaggio è ordinato (ha il ts definitivo)
 
 
@@ -342,7 +342,7 @@ upon receive(my_state, pend) from quorum Q in h,				# {Task 9}
 				t = tmp						# Un ts era già stato proposto: lo riuso
 			else
 				clock = clock + 1
-				t = ⟨clock, g⟩					# Nessun ts deciso: ne scelgo uno nuovo
+				t = ⟨clock, p⟩					# Nessun ts deciso: ne scelgo uno nuovo
 			for each q in g  AND  each leader q in dst
 				write(q, T[c, ptr[q]].tmp[g], t)		# Propongo il ts (come Task 2)
 				write(q, T[c, ptr[q]].rnd[g], round)
